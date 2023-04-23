@@ -15,12 +15,12 @@
 // doc: https://www.x.org/releases/X11R7.7/doc/libXtst/recordlib.html
 // example: https://github.com/TheRealHex/hecs-JWK/blob/97ba761b5461d5cf9050c75fa6cbaabac340c0c5/scan-x11.c
 
+// defaults
 #define TIME_LED_ON 15
-#define LED_VAL 1
-
+#define THREAD_PAUSE_MS 500
 #define DEV_CLASS "leds"
 #define DEV_ID "tpacpi::kbd_backlight"
-#define THREAD_PAUSE_MS 500
+#define DEV_BRIGHTNESS 1
 
 // watch thread
 pthread_t t_thread_id;
@@ -44,12 +44,15 @@ struct State s = { .t_press = -1,
 struct Device {
 	char class[64];
 	char id[64];
+    int brightness;
 };
 
 struct Device dev;
 
+
 void cleanup()
 {
+    /* Stop and join threads and exit */
     printf("Exitting ...\n");
 
     s.is_stopped = 1;
@@ -59,7 +62,7 @@ void cleanup()
     exit(0);
 }
 
-int logind_set_led(struct Device *d, unsigned int cur)
+int logind_set_led(struct Device *dev, int brightness)
 {
     /* Systemd function stolen from brightnessctl */
 	sd_bus *bus = NULL;
@@ -77,9 +80,9 @@ int logind_set_led(struct Device *d, unsigned int cur)
 			       NULL,
 			       NULL,
 			       "ssu",
-			       d->class,
-			       d->id,
-			       cur);
+			       dev->class,
+			       dev->id,
+			       brightness);
 
 	sd_bus_unref(bus);
 
@@ -91,23 +94,8 @@ int logind_set_led(struct Device *d, unsigned int cur)
 	return r >= 0;
 }
 
-void set_lights_on()
+void key_pressed_cb(XPointer arg, XRecordInterceptData *d)
 {
-    // triggered by key_pressed_cb callback
-    s.led_state = 1;
-    printf("Turning light on!\n");
-    logind_set_led(&dev, LED_VAL);
-}
-
-void set_lights_off(struct State *s)
-{
-    // triggered by thread
-    s->led_state = 0;
-    printf("Turning light off!\n");
-    logind_set_led(&dev, 0);
-}
-
-void key_pressed_cb(XPointer arg, XRecordInterceptData *d) {
     if (d->category != XRecordFromServer)
         return;
     
@@ -117,8 +105,11 @@ void key_pressed_cb(XPointer arg, XRecordInterceptData *d) {
 
     if(!repeat && type == KeyPress) {
         s.t_press = time(NULL);
-        if (!s.led_state)
-            set_lights_on();
+        if (!s.led_state) {
+            printf("Turning light on!\n");
+            s.led_state = 1;
+            logind_set_led(&dev, dev.brightness);
+        }
     }
     XRecordFreeData(d);
 }
@@ -129,15 +120,17 @@ void* watch_thread(void* arg)
     struct State *s = arg;
     while (!s->is_stopped) {
         time_t t_diff = time(NULL) - s->t_press;
-        if (s->led_state && t_diff > s->t_led_on)
-            set_lights_off(s);
+        if (s->led_state && t_diff > s->t_led_on) {
+            printf("Turning light off!\n");
+            s->led_state = 0;
+            logind_set_led(&dev, 0);
+        }
         usleep(THREAD_PAUSE_MS*1000);
     }
     return NULL;
 }
 
-
-void intHandler(int)
+void intHandler(int _)
 {
     /* Handle ctrl-C */
     cleanup();
@@ -149,11 +142,13 @@ void show_help()
            "Optional arguments:\n"
            "    -t TIME       Time in MS to turn LED on after keypress\n"
            "    -c            Device class!\n"
-           "    -i            Device id!\n");
+           "    -i            Device id\n"
+           "    -b            Brightness level id\n");
 }
 
 int err_stoi(char *str)
 {
+    /* String to unsigned integer, return -1 on error */
     int ret = 0;
     char *c = str;
     for (int i=strlen(str)-1 ; i>=0 ; i--, c++) {
@@ -169,7 +164,7 @@ int parse_args(struct Device* dev, struct State *s, int argc, char **argv)
 {
     int option;
 
-    while((option = getopt(argc, argv, "c:i:t:h")) != -1){ //get option from the getopt() method
+    while((option = getopt(argc, argv, "c:i:t:b:h")) != -1) {
         switch (option) {
             case 'c':
                 strcpy(dev->class, optarg);
@@ -178,12 +173,16 @@ int parse_args(struct Device* dev, struct State *s, int argc, char **argv)
                 strcpy(dev->id, optarg);
                 break;
             case 't':
-                int t = err_stoi(optarg);
-                if (t < 0) {
+                if ((s->t_led_on = err_stoi(optarg)) < 0) {
                     printf("ERROR: %s is not a number!\n", optarg);
                     return -1;
                 }
-                s->t_led_on = t;
+                break;
+            case 'b':
+                if ((dev->brightness = err_stoi(optarg)) < 0) {
+                    printf("ERROR: %s is not a number!\n", optarg);
+                    return -1;
+                }
                 break;
             case ':': 
                 printf("Option needs a value\n"); 
@@ -199,19 +198,17 @@ int parse_args(struct Device* dev, struct State *s, int argc, char **argv)
     return 1;
 }
 
-
 int main(int argc, char **argv) {
     // listen for ctrl-C
     signal(SIGINT, intHandler);
 
+    // set defaults
     strcpy(dev.class, DEV_CLASS);
     strcpy(dev.id, DEV_ID);
+    dev.brightness = DEV_BRIGHTNESS;
 
     if (parse_args(&dev, &s, argc, argv) < 0)
         exit(1);
-
-
-
 
     // create thread that turns off LED after n seconds
     pthread_create(&t_thread_id, NULL, &watch_thread, &s);
