@@ -141,9 +141,9 @@ void show_help()
     printf("KBLIGHTD :: Handle keyboard backlight\n"
            "Optional arguments:\n"
            "    -t TIME       Time in MS to turn LED on after keypress\n"
-           "    -c            Device class!\n"
+           "    -c            Device class\n"
            "    -i            Device id\n"
-           "    -b            Brightness level id\n");
+           "    -b            Brightness level\n");
 }
 
 int err_stoi(char *str)
