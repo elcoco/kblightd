@@ -10,7 +10,7 @@ It should work properly without using any arguments.
         -i            Device id
         -b            Brightness level
 
-## Compile
+## Compile and run
 
     $ make
     $ ./kblightd
