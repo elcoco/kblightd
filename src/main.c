@@ -15,7 +15,7 @@
 // doc: https://www.x.org/releases/X11R7.7/doc/libXtst/recordlib.html
 // example: https://github.com/TheRealHex/hecs-JWK/blob/97ba761b5461d5cf9050c75fa6cbaabac340c0c5/scan-x11.c
 
-#define TIME_LED_ON 5
+#define TIME_LED_ON 15
 #define LED_VAL 1
 
 #define DEV_CLASS "leds"
