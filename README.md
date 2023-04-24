@@ -1,7 +1,9 @@
 ## kblightd
 
 Kblightd turns on the keyboard backlight after a keypress and turns it back off after a specified amount of seconds.  
-It should work properly without using any arguments.  
+It should work properly on thinkpads without using any arguments.  
+Permissions are obtained by using the systemd-logind API.  
+Keypress monitoring depends on X11 and doesn't work with wayland.  
 
     KBLIGHTD :: Handle keyboard backlight
     Optional arguments:
