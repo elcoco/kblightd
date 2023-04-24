@@ -14,8 +14,8 @@ Keypress monitoring depends on X11 and doesn't work with wayland.
         -i            Device id
         -b            Brightness level
 
-## Compile and run
+## Compile and install
 
     $ make
-    $ make install
+    $ sudo make install
     $ /usr/local/bin/kblightd
