@@ -7,6 +7,7 @@
 #include <math.h>
 #include <stdarg.h>     // va_list
 #include <errno.h>
+#include <string.h>
 
 #include <linux/input.h>
 #include <systemd/sd-bus.h>
@@ -45,6 +46,7 @@ struct Device {
 	char class[64];
 	char id[64];
     int brightness;
+    char path[256];
 };
 
 // is passed to thread to check led state
@@ -65,12 +67,13 @@ struct ThreadState {
     struct Device led_dev;
 };
 
+// must be global to be able to access in a signal handler
+// TODO should probably find another way of doing this
 struct ThreadState ts = { .t_press = -1,
                           .led_state = 0,
                           .t_led_on = TIME_LED_ON,
                           .thread_err = 0,
                           .is_stopped = 0};
-
 
 void debug(char* fmt, ...)
 {
@@ -132,6 +135,21 @@ int logind_set_led(struct Device *led_dev, int brightness)
 	return 0;
 }
 
+int set_led(struct Device *dev, int value)
+{
+    info("Setting LED to %d\n", value);
+
+    FILE *fd = fopen(dev->path, "w");
+    if (fd == NULL) {
+        error("Failed to open path: %s\n", dev->path);
+        return -1;
+    }
+    fprintf(fd, "%d", value);
+
+    fclose(fd);
+    return 0;
+}
+
 void* watch_thread(void* arg)
 {
     /* Checks if n seconds have passed without keypress */
@@ -141,7 +159,8 @@ void* watch_thread(void* arg)
         if (ts->led_state && t_diff > ts->t_led_on) {
             ts->led_state = 0;
 
-            if (logind_set_led(&(ts->led_dev), LED_DEV_OFF) < 0) {
+            //if (logind_set_led(&(ts->led_dev), LED_DEV_OFF) < 0) {
+            if (set_led(&(ts->led_dev), LED_DEV_OFF) < 0) {
                 ts->thread_err = 1;
                 break;
             }
@@ -252,13 +271,15 @@ int get_keypress(FILE *fd)
     return 0;
 }
 
+
 int handle_keypress(struct ThreadState *ts)
 {
     /* Decide if LED should be turned on after keypress */
     ts->t_press = time(NULL);
     if (!ts->led_state) {
         ts->led_state = 1;
-        return logind_set_led(&(ts->led_dev), ts->led_dev.brightness);
+        return set_led(&(ts->led_dev), ts->led_dev.brightness);
+        //return logind_set_led(&(ts->led_dev), ts->led_dev.brightness);
     }
     return 0;
 }
@@ -280,6 +301,8 @@ int main(int argc, char **argv) {
     if (parse_args(&(ts.led_dev), &ts, argc, argv) < 0)
         return 1;
 
+    sprintf(ts.led_dev.path, "/sys/class/%s/%s/brightness", ts.led_dev.class, ts.led_dev.id);
+
     FILE *fd;
     if ((fd = fopen(inp_dev, "r")) == NULL) {
         error("Error opening device file: %s\n", inp_dev);
@@ -292,7 +315,8 @@ int main(int argc, char **argv) {
     }
 
     // start led in off state
-    if (logind_set_led(&(ts.led_dev), LED_DEV_OFF) < 0)
+    //if (logind_set_led(&(ts.led_dev), LED_DEV_OFF) < 0)
+    if (set_led(&(ts.led_dev), LED_DEV_OFF) < 0)
         return 1;
 
     // create watch thread that turns off LED after n seconds
@@ -313,13 +337,10 @@ int main(int argc, char **argv) {
     if (ts.thread_err)
         goto cleanup_on_err;
 
-    printf("normal exit\n");
-
     cleanup();
     return 0;
 
 cleanup_on_err:
-        printf("error exit\n");
         cleanup();
         return 1;
 }
