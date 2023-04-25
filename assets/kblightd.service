@@ -1,0 +1,8 @@
+[Unit]
+Description=Kblightd - Keyboard LED control daemon
+
+[Service]
+ExecStart=/usr/local/bin/kblightd
+
+[Install]
+WantedBy=multi-user.target

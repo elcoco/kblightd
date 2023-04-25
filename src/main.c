@@ -5,72 +5,110 @@
 #include <pthread.h>
 #include <signal.h>
 #include <math.h>
+#include <stdarg.h>     // va_list
+#include <errno.h>
 
-#include <X11/XKBlib.h>
-#include <X11/extensions/record.h>
-
+#include <linux/input.h>
 #include <systemd/sd-bus.h>
 
 // https://stackoverflow.com/questions/22749444/listening-to-keyboard-events-without-consuming-them-in-x11-keyboard-hooking
 // doc: https://www.x.org/releases/X11R7.7/doc/libXtst/recordlib.html
 // example: https://github.com/TheRealHex/hecs-JWK/blob/97ba761b5461d5cf9050c75fa6cbaabac340c0c5/scan-x11.c
+//
+
+// Kernel Input API
+// doc:     https://www.kernel.org/doc/html/v4.17/input/input.html
+// api:     https://www.kernel.org/doc/html/latest/driver-api/input.html
+// example: https://github.com/freedesktop-unofficial-mirror/evtest
+
+
+const char *inp_dev = "/dev/input/event3";
+
+#define THREAD_PAUSE_MS 500
 
 // defaults
 #define TIME_LED_ON 15
-#define THREAD_PAUSE_MS 500
-#define DEV_CLASS "leds"
-#define DEV_ID "tpacpi::kbd_backlight"
-#define DEV_BRIGHTNESS 1
+#define LED_DEV_CLASS "leds"
+#define LED_DEV_ID "tpacpi::kbd_backlight"
+#define LED_DEV_BRIGHTNESS 1
+#define LED_DEV_OFF 0
+
+int do_debug = 0;
 
 // watch thread
 pthread_t t_thread_id;
 
-// X11 display
-Display *dpy;
 
-// is passed to thread to check led state
-struct State {
-    time_t t_press;
-    int led_state;
-    int t_led_on;
-    int is_stopped;
-};
-
-struct State s = { .t_press = -1,
-                   .led_state = 1,
-                   .t_led_on = TIME_LED_ON,
-                   .is_stopped = 0};
-
+// device info for keyboard backlight
+// should be something like /sys/class/<class>/<id>/brightness
 struct Device {
 	char class[64];
 	char id[64];
     int brightness;
 };
 
-struct Device dev;
+// is passed to thread to check led state
+struct ThreadState {
+    // seconds since last keypress
+    time_t t_press;
+
+    // seconds since led was turned on
+    time_t t_led_on;
+    int led_state;
+
+    // flag indicates application stopped state
+    int is_stopped;
+
+    // is true when error in thread occured
+    int thread_err;
+
+    struct Device led_dev;
+};
+
+struct ThreadState ts = { .t_press = -1,
+                          .led_state = 0,
+                          .t_led_on = TIME_LED_ON,
+                          .thread_err = 0,
+                          .is_stopped = 0};
 
 
-void cleanup()
+void debug(char* fmt, ...)
 {
-    /* Stop and join threads and exit */
-    printf("Exitting ...\n");
-
-    s.is_stopped = 1;
-    pthread_join(t_thread_id, NULL);
-
-    //XCloseDisplay(dpy);
-    exit(0);
+    if (do_debug) {
+        va_list ptr;
+        va_start(ptr, fmt);
+        vfprintf(stdout, fmt, ptr);
+        va_end(ptr);
+    }
 }
 
-int logind_set_led(struct Device *dev, int brightness)
+void info(char* fmt, ...)
+{
+    va_list ptr;
+    va_start(ptr, fmt);
+    vfprintf(stdout, fmt, ptr);
+    va_end(ptr);
+}
+
+void error(char* fmt, ...)
+{
+    va_list ptr;
+    va_start(ptr, fmt);
+    vfprintf(stderr, fmt, ptr);
+    va_end(ptr);
+}
+
+int logind_set_led(struct Device *led_dev, int brightness)
 {
     /* Systemd function stolen from brightnessctl */
 	sd_bus *bus = NULL;
 	int r = sd_bus_default_system(&bus);
 	if (r < 0) {
-		fprintf(stderr, "Can't connect to system bus: %s\n", strerror(-r));
+		error("Can't connect to system bus: %s\n", strerror(-r));
 		return -1;
 	}
+
+    info("Setting LED to %d\n", brightness);
 
 	r = sd_bus_call_method(bus,
 			       "org.freedesktop.login1",
@@ -80,60 +118,54 @@ int logind_set_led(struct Device *dev, int brightness)
 			       NULL,
 			       NULL,
 			       "ssu",
-			       dev->class,
-			       dev->id,
+			       led_dev->class,
+			       led_dev->id,
 			       brightness);
 
 	sd_bus_unref(bus);
 
 	if (r < 0) {
-		fprintf(stderr, "Failed to set brightness: %s\n", strerror(-r));
-        cleanup();
+		error("Failed to set brightness: %s\n", strerror(-r));
+        return -1;
     }
 
-	return r >= 0;
-}
-
-void key_pressed_cb(XPointer arg, XRecordInterceptData *d)
-{
-    if (d->category != XRecordFromServer)
-        return;
-    
-    //int key = ((unsigned char*) d->data)[1];
-    int type = ((unsigned char*) d->data)[0] & 0x7F;
-    int repeat = d->data[2] & 1;
-
-    if(!repeat && type == KeyPress) {
-        s.t_press = time(NULL);
-        if (!s.led_state) {
-            printf("Turning light on!\n");
-            s.led_state = 1;
-            logind_set_led(&dev, dev.brightness);
-        }
-    }
-    XRecordFreeData(d);
+	return 0;
 }
 
 void* watch_thread(void* arg)
 {
     /* Checks if n seconds have passed without keypress */
-    struct State *s = arg;
-    while (!s->is_stopped) {
-        time_t t_diff = time(NULL) - s->t_press;
-        if (s->led_state && t_diff > s->t_led_on) {
-            printf("Turning light off!\n");
-            s->led_state = 0;
-            logind_set_led(&dev, 0);
+    struct ThreadState *ts = arg;
+    while (!ts->is_stopped) {
+        time_t t_diff = time(NULL) - ts->t_press;
+        if (ts->led_state && t_diff > ts->t_led_on) {
+            ts->led_state = 0;
+
+            if (logind_set_led(&(ts->led_dev), LED_DEV_OFF) < 0) {
+                ts->thread_err = 1;
+                break;
+            }
         }
         usleep(THREAD_PAUSE_MS*1000);
     }
     return NULL;
 }
 
+void cleanup()
+{
+    /* Stop and join thread */
+    printf("Exitting ...\n");
+
+    ts.is_stopped = 1;
+    pthread_join(t_thread_id, NULL);
+}
+
 void intHandler(int _)
 {
     /* Handle ctrl-C */
+    printf("cleaning up\n");
     cleanup();
+    exit(0);
 }
 
 void show_help()
@@ -160,29 +192,32 @@ int err_stoi(char *str)
     return ret;
 }
 
-int parse_args(struct Device* dev, struct State *s, int argc, char **argv)
+int parse_args(struct Device* led_dev, struct ThreadState *ts, int argc, char **argv)
 {
     int option;
 
-    while((option = getopt(argc, argv, "c:i:t:b:h")) != -1) {
+    while((option = getopt(argc, argv, "c:i:t:b:hD")) != -1) {
         switch (option) {
             case 'c':
-                strcpy(dev->class, optarg);
+                strcpy(led_dev->class, optarg);
                 break;
             case 'i':
-                strcpy(dev->id, optarg);
+                strcpy(led_dev->id, optarg);
                 break;
             case 't':
-                if ((s->t_led_on = err_stoi(optarg)) < 0) {
+                if ((ts->t_led_on = err_stoi(optarg)) < 0) {
                     printf("ERROR: %s is not a number!\n", optarg);
                     return -1;
                 }
                 break;
             case 'b':
-                if ((dev->brightness = err_stoi(optarg)) < 0) {
+                if ((led_dev->brightness = err_stoi(optarg)) < 0) {
                     printf("ERROR: %s is not a number!\n", optarg);
                     return -1;
                 }
+                break;
+            case 'D': 
+                do_debug = 1;
                 break;
             case ':': 
                 printf("Option needs a value\n"); 
@@ -198,40 +233,93 @@ int parse_args(struct Device* dev, struct State *s, int argc, char **argv)
     return 1;
 }
 
+int get_keypress(FILE *fd)
+{
+    /* Scan for keypress events
+     * doc: https://www.kernel.org/doc/html/v4.17/input/event-codes.html#input-event-codes
+     * event.type = event group
+     * event.code = specific event eg: KEY_A etc
+     * event.value: 1 = keypress
+     * event.value: 0 = keyrelease
+     */
+    struct input_event ev;
+    fread(&ev, sizeof(struct input_event), 1, fd);
+
+    if (ev.type == EV_KEY && ev.value == 1) {
+        debug("%d :: Keypress detected :: code=%d\n", ev.time, ev.code);
+        return 1;
+    }
+    return 0;
+}
+
+int handle_keypress(struct ThreadState *ts)
+{
+    /* Decide if LED should be turned on after keypress */
+    ts->t_press = time(NULL);
+    if (!ts->led_state) {
+        ts->led_state = 1;
+        return logind_set_led(&(ts->led_dev), ts->led_dev.brightness);
+    }
+    return 0;
+}
+
+
 int main(int argc, char **argv) {
+    if (getuid() != 0)
+        info("Not running as root, input events may not be readable\n");
+
     // listen for ctrl-C
     signal(SIGINT, intHandler);
+    signal(SIGTERM, intHandler);
 
     // set defaults
-    strcpy(dev.class, DEV_CLASS);
-    strcpy(dev.id, DEV_ID);
-    dev.brightness = DEV_BRIGHTNESS;
+    strcpy(ts.led_dev.class, LED_DEV_CLASS);
+    strcpy(ts.led_dev.id, LED_DEV_ID);
+    ts.led_dev.brightness = LED_DEV_BRIGHTNESS;
 
-    if (parse_args(&dev, &s, argc, argv) < 0)
-        exit(1);
+    if (parse_args(&(ts.led_dev), &ts, argc, argv) < 0)
+        return 1;
 
-    // create thread that turns off LED after n seconds
-    pthread_create(&t_thread_id, NULL, &watch_thread, &s);
-
-    XRecordRange* rr;
-    XRecordClientSpec rcs;
-    XRecordContext rc;
-
-    dpy = XOpenDisplay(NULL);
-    if (dpy == NULL) {
-        printf("Failed to open connection to X server\n");
-        cleanup();
+    FILE *fd;
+    if ((fd = fopen(inp_dev, "r")) == NULL) {
+        error("Error opening device file: %s\n", inp_dev);
+        return 1;
     }
 
-    printf("Start scanning...\n");
+    if (errno == EACCES && getuid() != 0) {
+        error("You do not have access to %s. Try running as root instead.\n", inp_dev);
+        return 1;
+    }
 
-    rr = XRecordAllocRange();
-    rr->device_events.first = KeyPress;
-    rr->device_events.last = ButtonReleaseMask;
-    rcs = XRecordAllClients;
-    rc = XRecordCreateContext (dpy, 0, &rcs, 1, &rr, 1);
-    XFree (rr);
-    XRecordEnableContext(dpy, rc, key_pressed_cb, NULL);
+    // start led in off state
+    if (logind_set_led(&(ts.led_dev), LED_DEV_OFF) < 0)
+        return 1;
 
+    // create watch thread that turns off LED after n seconds
+    pthread_create(&t_thread_id, NULL, &watch_thread, &ts);
+
+    printf("Start scanning for keyboard events...\n");
+    while (!ts.is_stopped) {
+
+        // blocking fd read
+        get_keypress(fd);
+
+        if (handle_keypress(&ts) < 0)
+            goto cleanup_on_err;
+
+    }
+
+    // check if we had error in thread
+    if (ts.thread_err)
+        goto cleanup_on_err;
+
+    printf("normal exit\n");
+
+    cleanup();
     return 0;
+
+cleanup_on_err:
+        printf("error exit\n");
+        cleanup();
+        return 1;
 }
