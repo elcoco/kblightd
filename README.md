@@ -4,8 +4,8 @@ Kblightd turns on the keyboard backlight after a keypress and turns it back off 
 It should work out of the box on thinkpads without using any arguments.  
 For other keyboards you may have to specify the device class and id.  
 
-Permissions are obtained by using the systemd-logind API.  
-Keypress monitoring depends on X11 and doesn't work with wayland.  
+Daemon must run as a privileged user.  
+This is easily done by using the installed systemd unit file.  
 
     KBLIGHTD :: Handle keyboard backlight
     Optional arguments:
@@ -18,4 +18,5 @@ Keypress monitoring depends on X11 and doesn't work with wayland.
 
     $ make
     $ sudo make install
-    $ /usr/local/bin/kblightd
+    $ sudo systemctl enable kblightd.service
+    $ sudo systemctl start kblightd.service
