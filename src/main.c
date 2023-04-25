@@ -23,7 +23,8 @@
 // example: https://github.com/freedesktop-unofficial-mirror/evtest
 
 
-const char *inp_dev = "/dev/input/event3";
+#define INP_DEV_DIR "/dev/input"
+#define INP_DEV_DISCOVER_PATH "/proc/bus/input/devices"
 
 #define THREAD_PAUSE_MS 500
 
@@ -35,6 +36,10 @@ const char *inp_dev = "/dev/input/event3";
 #define LED_DEV_OFF 0
 
 int do_debug = 0;
+
+// end program if true
+// must be global for signal handler to function
+int do_stop = 0;
 
 // watch thread
 pthread_t t_thread_id;
@@ -58,22 +63,11 @@ struct ThreadState {
     time_t t_led_on;
     int led_state;
 
-    // flag indicates application stopped state
-    int is_stopped;
-
     // is true when error in thread occured
     int thread_err;
 
     struct Device led_dev;
 };
-
-// must be global to be able to access in a signal handler
-// TODO should probably find another way of doing this
-struct ThreadState ts = { .t_press = -1,
-                          .led_state = 0,
-                          .t_led_on = TIME_LED_ON,
-                          .thread_err = 0,
-                          .is_stopped = 0};
 
 void debug(char* fmt, ...)
 {
@@ -99,6 +93,54 @@ void error(char* fmt, ...)
     va_start(ptr, fmt);
     vfprintf(stderr, fmt, ptr);
     va_end(ptr);
+}
+
+int get_dev_path(char *buf)
+{
+    /* Search for keyboard devices */
+    // Why is KB identifier 120013?? => https://unix.stackexchange.com/questions/74903/explain-ev-in-proc-bus-input-devices-data
+    char dev_str[8192] = "";
+    char dev_id[] = "120013";
+
+    FILE *fd = fopen(INP_DEV_DISCOVER_PATH, "r");
+
+    if (fd == NULL) {
+        error("Failed to open path: %s\n", INP_DEV_DISCOVER_PATH);
+        return -1;
+    }
+    int rd = fread(&dev_str, 1, sizeof(dev_str)-1, fd);
+
+    dev_str[rd] = '\0';
+
+    char *handlers = dev_str;
+    char *evs = dev_str;
+
+    do {
+        handlers = strstr(evs, "Handlers=");
+
+        if (handlers)
+            evs = strstr(handlers, "EV=");
+    }
+    while (evs && handlers && strncmp(evs+3, dev_id, strlen(dev_id)) != 0);
+
+    if (!evs || !handlers) {
+        info("Device not found\n");
+        return -1;
+    }
+
+    char *start;
+    char *end;
+
+    if ((start = strstr(handlers, "event"))) {
+        if ((end = strstr(start, " "))) {
+            start[end-start] = '\0';
+            sprintf(buf, "%s/%s", INP_DEV_DIR, start); 
+            return 0;
+        }
+    }
+
+    error("Malformed input device name\n");
+    return -1;
 }
 
 int logind_set_led(struct Device *led_dev, int brightness)
@@ -154,7 +196,7 @@ void* watch_thread(void* arg)
 {
     /* Checks if n seconds have passed without keypress */
     struct ThreadState *ts = arg;
-    while (!ts->is_stopped) {
+    while (!do_stop) {
         time_t t_diff = time(NULL) - ts->t_press;
         if (ts->led_state && t_diff > ts->t_led_on) {
             ts->led_state = 0;
@@ -162,6 +204,7 @@ void* watch_thread(void* arg)
             //if (logind_set_led(&(ts->led_dev), LED_DEV_OFF) < 0) {
             if (set_led(&(ts->led_dev), LED_DEV_OFF) < 0) {
                 ts->thread_err = 1;
+                do_stop = 1;
                 break;
             }
         }
@@ -173,17 +216,16 @@ void* watch_thread(void* arg)
 void cleanup()
 {
     /* Stop and join thread */
-    printf("Exitting ...\n");
-
-    ts.is_stopped = 1;
+    debug("cleaning up\n");
+    do_stop = 1;
     pthread_join(t_thread_id, NULL);
 }
 
 void intHandler(int _)
 {
     /* Handle ctrl-C */
-    printf("cleaning up\n");
     cleanup();
+    info("Exitting ...\n");
     exit(0);
 }
 
@@ -225,13 +267,13 @@ int parse_args(struct Device* led_dev, struct ThreadState *ts, int argc, char **
                 break;
             case 't':
                 if ((ts->t_led_on = err_stoi(optarg)) < 0) {
-                    printf("ERROR: %s is not a number!\n", optarg);
+                    error("ERROR: %s is not a number!\n", optarg);
                     return -1;
                 }
                 break;
             case 'b':
                 if ((led_dev->brightness = err_stoi(optarg)) < 0) {
-                    printf("ERROR: %s is not a number!\n", optarg);
+                    error("ERROR: %s is not a number!\n", optarg);
                     return -1;
                 }
                 break;
@@ -239,7 +281,7 @@ int parse_args(struct Device* led_dev, struct ThreadState *ts, int argc, char **
                 do_debug = 1;
                 break;
             case ':': 
-                printf("Option needs a value\n"); 
+                error("Option needs a value\n"); 
                 return -1;
             case 'h': 
                 show_help();
@@ -284,22 +326,36 @@ int handle_keypress(struct ThreadState *ts)
     return 0;
 }
 
+struct ThreadState init_state()
+{
+    struct ThreadState ts = { .t_press = -1,
+                              .led_state = 0,
+                              .t_led_on = TIME_LED_ON,
+                              .thread_err = 0 };
 
-int main(int argc, char **argv) {
-    if (getuid() != 0)
-        info("Not running as root, input events may not be readable\n");
-
-    // listen for ctrl-C
-    signal(SIGINT, intHandler);
-    signal(SIGTERM, intHandler);
-
-    // set defaults
     strcpy(ts.led_dev.class, LED_DEV_CLASS);
     strcpy(ts.led_dev.id, LED_DEV_ID);
     ts.led_dev.brightness = LED_DEV_BRIGHTNESS;
 
+    return ts;
+}
+
+int main(int argc, char **argv) {
+    signal(SIGINT, intHandler);
+    signal(SIGTERM, intHandler);
+
+    struct ThreadState ts = init_state();
+
     if (parse_args(&(ts.led_dev), &ts, argc, argv) < 0)
         return 1;
+
+    char inp_dev[256] = "";
+    if (get_dev_path(inp_dev) < 0) {
+        error("Failed to find keyboard device\n");
+        return 1;
+    }
+
+    debug("Found keyboard device: %s\n", inp_dev);
 
     sprintf(ts.led_dev.path, "/sys/class/%s/%s/brightness", ts.led_dev.class, ts.led_dev.id);
 
@@ -322,8 +378,8 @@ int main(int argc, char **argv) {
     // create watch thread that turns off LED after n seconds
     pthread_create(&t_thread_id, NULL, &watch_thread, &ts);
 
-    printf("Start scanning for keyboard events...\n");
-    while (!ts.is_stopped) {
+    info("Start scanning for keyboard events...\n");
+    while (!do_stop) {
 
         // blocking fd read
         get_keypress(fd);
