@@ -119,7 +119,7 @@ int get_led_dev(char *buf, char* search_dir)
 
     while ((e = readdir(dir)) != NULL) {
         if (strstr(e->d_name, "kbd_backlight")) {
-            sprintf(buf, "%s/%s", search_dir, e->d_name);
+            sprintf(buf, "%s/%s/brightness", search_dir, e->d_name);
             break;
         }
     }
