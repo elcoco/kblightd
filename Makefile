@@ -1,7 +1,7 @@
 SRC := src
 OBJ := obj
 CFLAGS := -g -Wall 
-LIBS   := -lX11 -lXtst -lpthread -lsystemd -lm
+LIBS   := -lpthread -lm
 CC := cc
 
 SYSTEMD_UNIT_DIR?=/etc/systemd/system

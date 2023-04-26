@@ -4,8 +4,6 @@
 #include <time.h>
 #include <pthread.h>
 #include <signal.h>
-#include <math.h>
-#include <stdarg.h>     // va_list
 #include <errno.h>
 #include <string.h>
 #include <dirent.h>
@@ -13,10 +11,7 @@
 #include <linux/input.h>
 #include <systemd/sd-bus.h>
 
-// https://stackoverflow.com/questions/22749444/listening-to-keyboard-events-without-consuming-them-in-x11-keyboard-hooking
-// doc: https://www.x.org/releases/X11R7.7/doc/libXtst/recordlib.html
-// example: https://github.com/TheRealHex/hecs-JWK/blob/97ba761b5461d5cf9050c75fa6cbaabac340c0c5/scan-x11.c
-//
+#include "utils.h"
 
 // Kernel Input API
 // doc:     https://www.kernel.org/doc/html/v4.17/input/input.html
@@ -24,69 +19,44 @@
 // example: https://github.com/freedesktop-unofficial-mirror/evtest
 
 
+// defaults
 #define LED_DEV_DIR "/sys/class/leds"
 #define INP_DEV_DIR "/dev/input"
 #define INP_DEV_DISCOVER_PATH "/proc/bus/input/devices"
 
-#define THREAD_PAUSE_MS 500
-
-// defaults
 #define TIME_LED_ON 15
 #define LED_DEV_ID "tpacpi::kbd_backlight"
 #define LED_DEV_BRIGHTNESS 1
 #define LED_DEV_OFF 0
 
-int do_debug = 0;
+#define THREAD_PAUSE_MS 500
 
 // end program if true
-// must be global for signal handler to function
+// must be global for signal handler to signal program exit
 int do_stop = 0;
 
-// watch thread
+// thread that turns LED off when no input has occured for N seconds
 pthread_t t_thread_id;
 
 
 // is passed to thread to check led state
-struct ThreadState {
+struct State {
     // seconds since last keypress
     time_t t_press;
 
     // seconds since led was turned on
     time_t t_led_on;
+    
     int led_state;
 
     // is true when error in thread occured
     int thread_err;
 
+    char inp_dev_path[256];
     char led_dev_path[256];
+
     int led_brightness;
 };
-
-void debug(char* fmt, ...)
-{
-    if (do_debug) {
-        va_list ptr;
-        va_start(ptr, fmt);
-        vfprintf(stdout, fmt, ptr);
-        va_end(ptr);
-    }
-}
-
-void info(char* fmt, ...)
-{
-    va_list ptr;
-    va_start(ptr, fmt);
-    vfprintf(stdout, fmt, ptr);
-    va_end(ptr);
-}
-
-void error(char* fmt, ...)
-{
-    va_list ptr;
-    va_start(ptr, fmt);
-    vfprintf(stderr, fmt, ptr);
-    va_end(ptr);
-}
 
 int get_kb_inp_dev(char *buf, char *inp_dev_dir, char *dev_discover_path)
 {
@@ -138,6 +108,7 @@ int get_kb_inp_dev(char *buf, char *inp_dev_dir, char *dev_discover_path)
 
 int get_led_dev(char *buf, char* search_dir)
 {
+    /* Find keyboard LED device in search dir */
     struct dirent *e;
 
     DIR *dir = opendir(search_dir);
@@ -181,15 +152,14 @@ int set_led(char *path, int value)
 void* watch_thread(void* arg)
 {
     /* Checks if n seconds have passed without keypress */
-    struct ThreadState *ts = arg;
+    struct State *s = arg;
     while (!do_stop) {
-        time_t t_diff = time(NULL) - ts->t_press;
-        if (ts->led_state && t_diff > ts->t_led_on) {
-            ts->led_state = 0;
+        time_t t_diff = time(NULL) - s->t_press;
+        if (s->led_state && t_diff > s->t_led_on) {
+            s->led_state = 0;
 
-            //if (logind_set_led(&(ts->led_dev), LED_DEV_OFF) < 0) {
-            if (set_led(ts->led_dev_path, LED_DEV_OFF) < 0) {
-                ts->thread_err = 1;
+            if (set_led(s->led_dev_path, LED_DEV_OFF) < 0) {
+                s->thread_err = 1;
                 do_stop = 1;
                 break;
             }
@@ -224,20 +194,6 @@ void show_help()
            "    -b            Brightness level\n");
 }
 
-int err_stoi(char *str)
-{
-    /* String to unsigned integer, return -1 on error */
-    int ret = 0;
-    char *c = str;
-    for (int i=strlen(str)-1 ; i>=0 ; i--, c++) {
-        if (*c >='0' && *c <= '9')
-            ret += (*c-48) * pow(10, i);
-        else
-            return -1;
-    }
-    return ret;
-}
-
 int get_keypress(FILE *fd)
 {
     /* Scan for keypress events
@@ -258,48 +214,52 @@ int get_keypress(FILE *fd)
 }
 
 
-int handle_keypress(struct ThreadState *ts)
+int handle_keypress(struct State *s)
 {
     /* Decide if LED should be turned on after keypress */
-    ts->t_press = time(NULL);
-    if (!ts->led_state) {
-        ts->led_state = 1;
-        return set_led(ts->led_dev_path, ts->led_brightness);
-        //return logind_set_led(&(ts->led_dev), ts->led_dev.brightness);
+    s->t_press = time(NULL);
+    if (!s->led_state) {
+        s->led_state = 1;
+        return set_led(s->led_dev_path, s->led_brightness);
     }
     return 0;
 }
 
-struct ThreadState init_state()
+struct State state_init()
 {
-    struct ThreadState ts = { .t_press = -1,
+    struct State s = { .t_press = -1,
                               .led_state = 0,
                               .t_led_on = TIME_LED_ON,
                               .thread_err = 0 };
 
-    strcpy(ts.led_dev_path, "");
-    ts.led_brightness = LED_DEV_BRIGHTNESS;
+    strcpy(s.led_dev_path, "");
+    strcpy(s.inp_dev_path, "");
 
-    return ts;
+    s.led_brightness = LED_DEV_BRIGHTNESS;
+
+    return s;
 }
 
-int parse_args(struct ThreadState *ts, int argc, char **argv)
+int parse_args(struct State *s, int argc, char **argv)
 {
     int option;
 
-    while((option = getopt(argc, argv, "l:t:b:hD")) != -1) {
+    while((option = getopt(argc, argv, "l:i:t:b:hD")) != -1) {
         switch (option) {
             case 'l':
-                strcpy(ts->led_dev_path, optarg);
+                strcpy(s->led_dev_path, optarg);
+                break;
+            case 'i':
+                strcpy(s->inp_dev_path, optarg);
                 break;
             case 't':
-                if ((ts->t_led_on = err_stoi(optarg)) < 0) {
+                if ((s->t_led_on = err_stoi(optarg)) < 0) {
                     error("ERROR: %s is not a number!\n", optarg);
                     return -1;
                 }
                 break;
             case 'b':
-                if ((ts->led_brightness = err_stoi(optarg)) < 0) {
+                if ((s->led_brightness = err_stoi(optarg)) < 0) {
                     error("ERROR: %s is not a number!\n", optarg);
                     return -1;
                 }
@@ -325,46 +285,44 @@ int main(int argc, char **argv) {
     signal(SIGINT, intHandler);
     signal(SIGTERM, intHandler);
 
-    struct ThreadState ts = init_state();
+    struct State s = state_init();
 
-    if (parse_args(&ts, argc, argv) < 0)
+    if (parse_args(&s, argc, argv) < 0)
         return 1;
 
-    // TODO don't use separate class/id in parse args but request
-    // full paths
-    // if path is given as cli arg, then don't auto discover
-
-    char inp_dev_path[256] = "";
-    if (get_kb_inp_dev(inp_dev_path, INP_DEV_DIR, INP_DEV_DISCOVER_PATH) < 0) {
-        error("Failed to find keyboard device\n");
-        return 1;
+    if (strlen(s.inp_dev_path) == 0) {
+        if (get_kb_inp_dev(s.inp_dev_path, INP_DEV_DIR, INP_DEV_DISCOVER_PATH) < 0) {
+            error("Failed to find keyboard device\n");
+            return 1;
+        }
     }
-    info("Found keyboard device: %s\n", inp_dev_path);
+    info("Using keyboard device: %s\n", s.inp_dev_path);
 
-    if (get_led_dev(ts.led_dev_path, LED_DEV_DIR) < 0) {
-        error("Failed to find keyboard LED device\n");
-        return 1;
+    if (strlen(s.led_dev_path) == 0) {
+        if (get_led_dev(s.led_dev_path, LED_DEV_DIR) < 0) {
+            error("Failed to find keyboard LED device\n");
+            return 1;
+        }
     }
-    info("Found keyboard LED device: %s\n", ts.led_dev_path);
+    info("Using keyboard LED device: %s\n", s.led_dev_path);
 
     FILE *fd;
-    if ((fd = fopen(inp_dev_path, "r")) == NULL) {
-        error("Error opening device file: %s\n", inp_dev_path);
+    if ((fd = fopen(s.inp_dev_path, "r")) == NULL) {
+        error("Error opening device file: %s\n", s.inp_dev_path);
         return 1;
     }
 
     if (errno == EACCES && getuid() != 0) {
-        error("You do not have access to %s. Try running as root instead.\n", inp_dev_path);
+        error("You do not have access to %s. Try running as root instead.\n", s.inp_dev_path);
         return 1;
     }
 
     // start led in off state
-    //if (logind_set_led(&(ts.led_dev), LED_DEV_OFF) < 0)
-    if (set_led(ts.led_dev_path, LED_DEV_OFF) < 0)
+    if (set_led(s.led_dev_path, LED_DEV_OFF) < 0)
         return 1;
 
     // create watch thread that turns off LED after n seconds
-    pthread_create(&t_thread_id, NULL, &watch_thread, &ts);
+    pthread_create(&t_thread_id, NULL, &watch_thread, &s);
 
     info("Start scanning for keyboard events...\n");
     while (!do_stop) {
@@ -372,13 +330,13 @@ int main(int argc, char **argv) {
         // blocking fd read
         get_keypress(fd);
 
-        if (handle_keypress(&ts) < 0)
+        if (handle_keypress(&s) < 0)
             goto cleanup_on_err;
 
     }
 
     // check if we had error in thread
-    if (ts.thread_err)
+    if (s.thread_err)
         goto cleanup_on_err;
 
     cleanup();
