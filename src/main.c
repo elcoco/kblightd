@@ -191,7 +191,9 @@ void show_help()
            "Optional arguments:\n"
            "    -t TIME       Time in MS to turn LED on after keypress\n"
            "    -l            LED device path\n"
-           "    -b            Brightness level\n");
+           "    -i            Input device path\n"
+           "    -b            Brightness level\n",
+           "    -D            Debugging\n");
 }
 
 int get_keypress(FILE *fd)
