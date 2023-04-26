@@ -192,7 +192,7 @@ void show_help()
            "    -t TIME       Time in MS to turn LED on after keypress\n"
            "    -l            LED device path\n"
            "    -i            Input device path\n"
-           "    -b            Brightness level\n",
+           "    -b            Brightness level\n"
            "    -D            Debugging\n");
 }
 
