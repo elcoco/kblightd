@@ -8,6 +8,7 @@
 #include <stdarg.h>     // va_list
 #include <errno.h>
 #include <string.h>
+#include <dirent.h>
 
 #include <linux/input.h>
 #include <systemd/sd-bus.h>
@@ -23,6 +24,7 @@
 // example: https://github.com/freedesktop-unofficial-mirror/evtest
 
 
+#define LED_DEV_DIR "/sys/class/leds"
 #define INP_DEV_DIR "/dev/input"
 #define INP_DEV_DISCOVER_PATH "/proc/bus/input/devices"
 
@@ -30,7 +32,6 @@
 
 // defaults
 #define TIME_LED_ON 15
-#define LED_DEV_CLASS "leds"
 #define LED_DEV_ID "tpacpi::kbd_backlight"
 #define LED_DEV_BRIGHTNESS 1
 #define LED_DEV_OFF 0
@@ -45,15 +46,6 @@ int do_stop = 0;
 pthread_t t_thread_id;
 
 
-// device info for keyboard backlight
-// should be something like /sys/class/<class>/<id>/brightness
-struct Device {
-	char class[64];
-	char id[64];
-    int brightness;
-    char path[256];
-};
-
 // is passed to thread to check led state
 struct ThreadState {
     // seconds since last keypress
@@ -66,7 +58,8 @@ struct ThreadState {
     // is true when error in thread occured
     int thread_err;
 
-    struct Device led_dev;
+    char led_dev_path[256];
+    int led_brightness;
 };
 
 void debug(char* fmt, ...)
@@ -95,17 +88,17 @@ void error(char* fmt, ...)
     va_end(ptr);
 }
 
-int get_dev_path(char *buf)
+int get_kb_inp_dev(char *buf, char *inp_dev_dir, char *dev_discover_path)
 {
     /* Search for keyboard devices */
     // Why is KB identifier 120013?? => https://unix.stackexchange.com/questions/74903/explain-ev-in-proc-bus-input-devices-data
     char dev_str[8192] = "";
     char dev_id[] = "120013";
 
-    FILE *fd = fopen(INP_DEV_DISCOVER_PATH, "r");
+    FILE *fd = fopen(dev_discover_path, "r");
 
     if (fd == NULL) {
-        error("Failed to open path: %s\n", INP_DEV_DISCOVER_PATH);
+        error("Failed to open path: %s\n", dev_discover_path);
         return -1;
     }
     int rd = fread(&dev_str, 1, sizeof(dev_str)-1, fd);
@@ -124,7 +117,7 @@ int get_dev_path(char *buf)
     while (evs && handlers && strncmp(evs+3, dev_id, strlen(dev_id)) != 0);
 
     if (!evs || !handlers) {
-        info("Device not found\n");
+        error("Input device not found\n");
         return -1;
     }
 
@@ -134,7 +127,7 @@ int get_dev_path(char *buf)
     if ((start = strstr(handlers, "event"))) {
         if ((end = strstr(start, " "))) {
             start[end-start] = '\0';
-            sprintf(buf, "%s/%s", INP_DEV_DIR, start); 
+            sprintf(buf, "%s/%s", inp_dev_dir, start); 
             return 0;
         }
     }
@@ -143,47 +136,40 @@ int get_dev_path(char *buf)
     return -1;
 }
 
-int logind_set_led(struct Device *led_dev, int brightness)
+int get_led_dev(char *buf, char* search_dir)
 {
-    /* Systemd function stolen from brightnessctl */
-	sd_bus *bus = NULL;
-	int r = sd_bus_default_system(&bus);
-	if (r < 0) {
-		error("Can't connect to system bus: %s\n", strerror(-r));
-		return -1;
-	}
+    struct dirent *e;
 
-    info("Setting LED to %d\n", brightness);
-
-	r = sd_bus_call_method(bus,
-			       "org.freedesktop.login1",
-			       "/org/freedesktop/login1/session/auto",
-			       "org.freedesktop.login1.Session",
-			       "SetBrightness",
-			       NULL,
-			       NULL,
-			       "ssu",
-			       led_dev->class,
-			       led_dev->id,
-			       brightness);
-
-	sd_bus_unref(bus);
-
-	if (r < 0) {
-		error("Failed to set brightness: %s\n", strerror(-r));
+    DIR *dir = opendir(search_dir);
+    if (dir == NULL) {
+        error("Failed to open directory: %s\n", search_dir);
         return -1;
     }
 
-	return 0;
+    while ((e = readdir(dir)) != NULL) {
+        if (strstr(e->d_name, "kbd_backlight")) {
+            sprintf(buf, "%s/%s", search_dir, e->d_name);
+            break;
+        }
+    }
+
+    closedir(dir);
+
+    if (e == NULL) {
+        error("Failed to find kb led device in: %s\n", search_dir);
+        return -1;
+    }
+
+    return 0;
 }
 
-int set_led(struct Device *dev, int value)
+int set_led(char *path, int value)
 {
     info("Setting LED to %d\n", value);
 
-    FILE *fd = fopen(dev->path, "w");
+    FILE *fd = fopen(path, "w");
     if (fd == NULL) {
-        error("Failed to open path: %s\n", dev->path);
+        error("Failed to open path: %s\n", path);
         return -1;
     }
     fprintf(fd, "%d", value);
@@ -202,7 +188,7 @@ void* watch_thread(void* arg)
             ts->led_state = 0;
 
             //if (logind_set_led(&(ts->led_dev), LED_DEV_OFF) < 0) {
-            if (set_led(&(ts->led_dev), LED_DEV_OFF) < 0) {
+            if (set_led(ts->led_dev_path, LED_DEV_OFF) < 0) {
                 ts->thread_err = 1;
                 do_stop = 1;
                 break;
@@ -234,8 +220,7 @@ void show_help()
     printf("KBLIGHTD :: Handle keyboard backlight\n"
            "Optional arguments:\n"
            "    -t TIME       Time in MS to turn LED on after keypress\n"
-           "    -c            Device class\n"
-           "    -i            Device id\n"
+           "    -l            LED device path\n"
            "    -b            Brightness level\n");
 }
 
@@ -251,47 +236,6 @@ int err_stoi(char *str)
             return -1;
     }
     return ret;
-}
-
-int parse_args(struct Device* led_dev, struct ThreadState *ts, int argc, char **argv)
-{
-    int option;
-
-    while((option = getopt(argc, argv, "c:i:t:b:hD")) != -1) {
-        switch (option) {
-            case 'c':
-                strcpy(led_dev->class, optarg);
-                break;
-            case 'i':
-                strcpy(led_dev->id, optarg);
-                break;
-            case 't':
-                if ((ts->t_led_on = err_stoi(optarg)) < 0) {
-                    error("ERROR: %s is not a number!\n", optarg);
-                    return -1;
-                }
-                break;
-            case 'b':
-                if ((led_dev->brightness = err_stoi(optarg)) < 0) {
-                    error("ERROR: %s is not a number!\n", optarg);
-                    return -1;
-                }
-                break;
-            case 'D': 
-                do_debug = 1;
-                break;
-            case ':': 
-                error("Option needs a value\n"); 
-                return -1;
-            case 'h': 
-                show_help();
-                return -1;
-            case '?': 
-                show_help();
-                return -1;
-       }
-    }
-    return 1;
 }
 
 int get_keypress(FILE *fd)
@@ -320,7 +264,7 @@ int handle_keypress(struct ThreadState *ts)
     ts->t_press = time(NULL);
     if (!ts->led_state) {
         ts->led_state = 1;
-        return set_led(&(ts->led_dev), ts->led_dev.brightness);
+        return set_led(ts->led_dev_path, ts->led_brightness);
         //return logind_set_led(&(ts->led_dev), ts->led_dev.brightness);
     }
     return 0;
@@ -333,11 +277,48 @@ struct ThreadState init_state()
                               .t_led_on = TIME_LED_ON,
                               .thread_err = 0 };
 
-    strcpy(ts.led_dev.class, LED_DEV_CLASS);
-    strcpy(ts.led_dev.id, LED_DEV_ID);
-    ts.led_dev.brightness = LED_DEV_BRIGHTNESS;
+    strcpy(ts.led_dev_path, "");
+    ts.led_brightness = LED_DEV_BRIGHTNESS;
 
     return ts;
+}
+
+int parse_args(struct ThreadState *ts, int argc, char **argv)
+{
+    int option;
+
+    while((option = getopt(argc, argv, "l:t:b:hD")) != -1) {
+        switch (option) {
+            case 'l':
+                strcpy(ts->led_dev_path, optarg);
+                break;
+            case 't':
+                if ((ts->t_led_on = err_stoi(optarg)) < 0) {
+                    error("ERROR: %s is not a number!\n", optarg);
+                    return -1;
+                }
+                break;
+            case 'b':
+                if ((ts->led_brightness = err_stoi(optarg)) < 0) {
+                    error("ERROR: %s is not a number!\n", optarg);
+                    return -1;
+                }
+                break;
+            case 'D': 
+                do_debug = 1;
+                break;
+            case ':': 
+                error("Option needs a value\n"); 
+                return -1;
+            case 'h': 
+                show_help();
+                return -1;
+            case '?': 
+                show_help();
+                return -1;
+       }
+    }
+    return 1;
 }
 
 int main(int argc, char **argv) {
@@ -346,33 +327,40 @@ int main(int argc, char **argv) {
 
     struct ThreadState ts = init_state();
 
-    if (parse_args(&(ts.led_dev), &ts, argc, argv) < 0)
+    if (parse_args(&ts, argc, argv) < 0)
         return 1;
 
-    char inp_dev[256] = "";
-    if (get_dev_path(inp_dev) < 0) {
+    // TODO don't use separate class/id in parse args but request
+    // full paths
+    // if path is given as cli arg, then don't auto discover
+
+    char inp_dev_path[256] = "";
+    if (get_kb_inp_dev(inp_dev_path, INP_DEV_DIR, INP_DEV_DISCOVER_PATH) < 0) {
         error("Failed to find keyboard device\n");
         return 1;
     }
+    info("Found keyboard device: %s\n", inp_dev_path);
 
-    debug("Found keyboard device: %s\n", inp_dev);
-
-    sprintf(ts.led_dev.path, "/sys/class/%s/%s/brightness", ts.led_dev.class, ts.led_dev.id);
+    if (get_led_dev(ts.led_dev_path, LED_DEV_DIR) < 0) {
+        error("Failed to find keyboard LED device\n");
+        return 1;
+    }
+    info("Found keyboard LED device: %s\n", ts.led_dev_path);
 
     FILE *fd;
-    if ((fd = fopen(inp_dev, "r")) == NULL) {
-        error("Error opening device file: %s\n", inp_dev);
+    if ((fd = fopen(inp_dev_path, "r")) == NULL) {
+        error("Error opening device file: %s\n", inp_dev_path);
         return 1;
     }
 
     if (errno == EACCES && getuid() != 0) {
-        error("You do not have access to %s. Try running as root instead.\n", inp_dev);
+        error("You do not have access to %s. Try running as root instead.\n", inp_dev_path);
         return 1;
     }
 
     // start led in off state
     //if (logind_set_led(&(ts.led_dev), LED_DEV_OFF) < 0)
-    if (set_led(&(ts.led_dev), LED_DEV_OFF) < 0)
+    if (set_led(ts.led_dev_path, LED_DEV_OFF) < 0)
         return 1;
 
     // create watch thread that turns off LED after n seconds
