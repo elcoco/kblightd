@@ -9,7 +9,6 @@
 #include <dirent.h>
 
 #include <linux/input.h>
-#include <systemd/sd-bus.h>
 
 #include "utils.h"
 
@@ -32,12 +31,12 @@
 #define THREAD_PAUSE_MS 500
 
 // end program if true
-// must be global for signal handler to signal program exit
+// global for signal handler to signal program exit
 int do_stop = 0;
 
 // thread that turns LED off when no input has occured for N seconds
+// global so we can join threads from cleanup() on SIGTERM
 pthread_t t_thread_id;
-
 
 // is passed to thread to check led state
 struct State {
@@ -57,6 +56,7 @@ struct State {
 
     int led_brightness;
 };
+
 
 int get_kb_inp_dev(char *buf, char *inp_dev_dir, char *dev_discover_path)
 {
