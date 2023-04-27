@@ -283,6 +283,37 @@ int parse_args(struct State *s, int argc, char **argv)
     return 1;
 }
 
+int inp_dev_loop(struct State *s)
+{
+    /* Start looking for input device events */
+    FILE *fd;
+    if ((fd = fopen(s->inp_dev_path, "r")) == NULL) {
+        error("Error opening device file: %s\n", s->inp_dev_path);
+        return -1;
+    }
+
+    if (errno == EACCES && getuid() != 0) {
+        error("You do not have access to %s. Try running as root instead.\n", s->inp_dev_path);
+        return -1;
+    }
+
+    info("Start scanning for keyboard events...\n");
+    while (!do_stop) {
+
+        // blocking fd read
+        get_keypress(fd);
+
+        if (handle_keypress(s) < 0)
+            return -1;
+    }
+
+    // check if we had error in thread
+    if (s->thread_err)
+        return -1;
+
+    return 0;
+}
+
 int main(int argc, char **argv) {
     signal(SIGINT, intHandler);
     signal(SIGTERM, intHandler);
@@ -292,6 +323,7 @@ int main(int argc, char **argv) {
     if (parse_args(&s, argc, argv) < 0)
         return 1;
 
+    // auto discover device paths if not given as cli arg
     if (strlen(s.inp_dev_path) == 0) {
         if (get_kb_inp_dev(s.inp_dev_path, INP_DEV_DIR, INP_DEV_DISCOVER_PATH) < 0) {
             error("Failed to find keyboard device\n");
@@ -306,18 +338,7 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    info("Using keyboard LED device: %s\n", s.led_dev_path);
-
-    FILE *fd;
-    if ((fd = fopen(s.inp_dev_path, "r")) == NULL) {
-        error("Error opening device file: %s\n", s.inp_dev_path);
-        return 1;
-    }
-
-    if (errno == EACCES && getuid() != 0) {
-        error("You do not have access to %s. Try running as root instead.\n", s.inp_dev_path);
-        return 1;
-    }
+    info("Using keyboard LED device path: %s\n", s.led_dev_path);
 
     // start led in off state
     if (set_led(s.led_dev_path, LED_DEV_OFF) < 0)
@@ -326,25 +347,12 @@ int main(int argc, char **argv) {
     // create watch thread that turns off LED after n seconds
     pthread_create(&t_thread_id, NULL, &watch_thread, &s);
 
-    info("Start scanning for keyboard events...\n");
-    while (!do_stop) {
-
-        // blocking fd read
-        get_keypress(fd);
-
-        if (handle_keypress(&s) < 0)
-            goto cleanup_on_err;
-
+    // start checking for input device events
+    if (inp_dev_loop(&s) < 0) {
+        cleanup();
+        return 1;
     }
-
-    // check if we had error in thread
-    if (s.thread_err)
-        goto cleanup_on_err;
 
     cleanup();
     return 0;
-
-cleanup_on_err:
-        cleanup();
-        return 1;
 }
