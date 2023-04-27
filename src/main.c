@@ -323,7 +323,7 @@ int main(int argc, char **argv) {
     if (parse_args(&s, argc, argv) < 0)
         return 1;
 
-    // auto discover device paths if not given as cli arg
+    // auto discover device paths if not given as cli args
     if (strlen(s.inp_dev_path) == 0) {
         if (get_kb_inp_dev(s.inp_dev_path, INP_DEV_DIR, INP_DEV_DISCOVER_PATH) < 0) {
             error("Failed to find keyboard device\n");
