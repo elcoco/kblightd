@@ -24,7 +24,6 @@
 #define INP_DEV_DISCOVER_PATH "/proc/bus/input/devices"
 
 #define TIME_LED_ON 15
-#define LED_DEV_ID "tpacpi::kbd_backlight"
 #define LED_DEV_BRIGHTNESS 1
 #define LED_DEV_OFF 0
 
@@ -209,7 +208,7 @@ int get_keypress(FILE *fd)
     fread(&ev, sizeof(struct input_event), 1, fd);
 
     if (ev.type == EV_KEY && ev.value == 1) {
-        debug("%d :: Keypress detected :: code=%d\n", ev.time, ev.code);
+        debug("%d :: Keypress detected :: code=%d\n", ev.time.tv_sec, ev.code);
         return 1;
     }
     return 0;
