@@ -214,7 +214,6 @@ int get_keypress(FILE *fd)
     return 0;
 }
 
-
 int handle_keypress(struct State *s)
 {
     /* Decide if LED should be turned on after keypress */
@@ -343,7 +342,7 @@ int main(int argc, char **argv) {
     if (set_led(s.led_dev_path, LED_DEV_OFF) < 0)
         return 1;
 
-    // create watch thread that turns off LED after n seconds
+    // create watch thread that turns off LED after n seconds without input
     pthread_create(&t_thread_id, NULL, &watch_thread, &s);
 
     // start checking for input device events
